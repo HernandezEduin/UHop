@@ -36,6 +36,10 @@ parser.add_argument('--show_result', action='store', type=bool, default=False)
 parser.add_argument('--train_embedding', action='store', type=bool, default=False)
 parser.add_argument('--log_result', action='store', type=bool, default=False)
 parser.add_argument('--dataset', action='store', type=str) #sq, wq, wq_train1_test2
+parser.add_argument('--data_dir', type=str, default=None,
+                    help='Override path of prepared THESEUS dataset')
+parser.add_argument('--device', choices=('auto', 'cpu', 'cuda'), default='auto')
+parser.add_argument('--num_workers', type=int, default=0)
 parser.add_argument('--saved_dir', action='store', type=str, default='saved_model')
 parser.add_argument('--hop_weight', action='store', type=float, default=1)
 parser.add_argument('--task_weight', action='store', type=float, default=1)
@@ -49,6 +53,10 @@ parser.add_argument('--pretrained_bert', action='store', type=str, default='bert
 parser.add_argument('--q_representation', action='store', type=str, default='lstm')
 
 args = parser.parse_args()
+if args.device == 'auto':
+    args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+if args.device == 'cuda' and not torch.cuda.is_available():
+    raise RuntimeError('CUDA requested but unavailable')
 print(f'args: {args}')
 
 import_model_str = 'from model.{} import Model as Model'.format(args.model)
@@ -125,14 +133,23 @@ elif args.framework == 'UHop':
     elif args.dataset.lower() == 'pql3':
         with open('../data/PQ/PQL3/rela2id.json', 'r') as f:
             rela2id =json.load(f)
+    elif args.dataset.lower() in ('kinship', 'mquake_st_single', 'mquake_st_multi'):
+        theseus_dir = args.data_dir or f'../data/THESEUS/{args.dataset.lower()}'
+        with open(os.path.join(theseus_dir, 'rela2id.json'), 'r') as f:
+            rela2id = json.load(f)
     else:
         raise ValueError('Unknown dataset.')
 
 #print(rela2id)
 #print(rela2id['scientist'])
 #exit()
-word2id_path = '../data/glove.300d.word2id.json' if args.emb_size == 300 else '../data/glove.50d.word2id.json' 
-word_emb_path = '../data/glove.300d.word_emb.npy' if args.emb_size == 300 else '../data/glove.50d.word_emb.npy'
+if args.framework == 'UHop' and args.dataset.lower() in ('kinship', 'mquake_st_single', 'mquake_st_multi'):
+    theseus_dir = args.data_dir or f'../data/THESEUS/{args.dataset.lower()}'
+    word2id_path = os.path.join(theseus_dir, 'word2id.json')
+    word_emb_path = os.path.join(theseus_dir, 'word_emb.npy')
+else:
+    word2id_path = '../data/glove.300d.word2id.json' if args.emb_size == 300 else '../data/glove.50d.word2id.json'
+    word_emb_path = '../data/glove.300d.word_emb.npy' if args.emb_size == 300 else '../data/glove.50d.word_emb.npy'
 with open(word2id_path, 'r') as f:
     word2id = json.load(f)
 word_emb = np.load(word_emb_path)
@@ -146,7 +163,7 @@ if args.framework == 'baseline':
 
 if args.framework == 'UHop':
     uhop = Framework(args, word2id, rela2id)
-    model = Model(args).cuda()
+    model = Model(args).to(args.device)
     if args.train == True:
         model = uhop.train(model)
         loss, acc, scores, labels = uhop.evaluate(model=None, mode='test', dataset=None, output_result=True)
@@ -155,7 +172,7 @@ if args.framework == 'UHop':
 
 elif args.framework == 'baseline':
     baseline = Framework(args, word2id, rela_token2id)
-    model = Model(args).cuda()
+    model = Model(args).to(args.device)
     if args.train == True:
         model = baseline.train(model)
         baseline.evaluate(model=None, mode='test', dataset=None, output_result=True)

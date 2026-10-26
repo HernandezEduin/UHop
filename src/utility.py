@@ -51,7 +51,7 @@ def save_model_with_result(model, loss, acc, rc, td, td_rc, path):
 def load_model(model, path):
     path = os.path.join(path, 'model.pth')
     print(f'load model from: {path}')
-    model.load_state_dict(torch.load(path))
+    model.load_state_dict(torch.load(path, map_location=next(model.parameters()).device))
     return model
 
 
