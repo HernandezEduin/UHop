@@ -92,7 +92,7 @@ python script/evaluate_theseus.py \
   --checkpoint saved_model/HR_BiLSTM_plus_0 --split test
 ~~~
 
-It uses the original trained scoring model and the same RC/TD comparisons to choose a variable-length relation chain. It reports:
+It uses the original trained scoring model and applies the original RC/TD comparison order to choose a variable-length relation chain. For each TD decision, the previously selected relation and the possible next relations are scored together with aligned histories and shared padding, matching `Framework._termination_decision`. Scores from separate candidate batches must not be compared directly because UHop's LSTM reads padded sequences. The adapter does not use the gold hop count to decide when to stop. It reports:
 
 - Relation-chain exact-match accuracy
 - Answer reachability: at least one gold entity in the terminal relation-derived frontier
@@ -127,7 +127,25 @@ The `--question-variant canonical` default uses the released `Question` field. `
 
 Paraphrases may introduce tokens absent from the canonical-only prepared vocabulary. To avoid silently treating every new word as unknown, the evaluator **appends frozen GloVe vectors for unseen paraphrase tokens after loading the checkpoint**, retaining every original token ID and all trained weights. The existing Hugging Face GloVe cache is reused. If the checkpoint was prepared from a local text GloVe file, pass `--glove /path/to/glove.6B.300d.txt` for paraphrase evaluation. This inference-time vocabulary extension does not change UHop's training procedure.
 
-The canonical output remains `test_navigation.jsonl` and `test_navigation.summary.json`. Paraphrase evaluation saves to distinct `test_navigation_paraphrased.*` files by default, or to an explicit `--output` prefix.
+The canonical output remains `test_navigation.jsonl` and `test_navigation.summary.json`. Paraphrase evaluation saves to distinct `test_navigation_paraphrased.*` files by default, or to an explicit `--output` prefix. Each JSONL prediction now records `predicted_hops` and `stop_reason`, one of `learned_termination`, `no_outgoing_relations`, or `max_hops`. Summary metrics include `stop_reasons` and `premature_stop_reasons` counts overall and by reference hop length. These counts distinguish TD decisions from graph dead ends, using the reference path length for diagnostics only.
+
+### Termination diagnostic (not a baseline result)
+
+If an existing checkpoint achieves high teacher-forced RC/TD accuracy but low free-running answer reachability, compare the standard run against a run with TD disabled:
+
+~~~bash
+python script/evaluate_theseus.py \\
+  --checkpoint saved_model/HR_BiLSTM_plus_2 \\
+  --split valid --max-hops 4 --device cuda \\
+  --termination-mode learned
+
+python script/evaluate_theseus.py \\
+  --checkpoint saved_model/HR_BiLSTM_plus_2 \\
+  --split valid --max-hops 4 --device cuda \\
+  --termination-mode ignore
+~~~
+
+`learned` is the default and is the only supported UHop benchmark protocol. `ignore` forces navigation to continue until `--max-hops` or a graph dead end, without consulting the learned termination decision. It is **only a diagnostic**, not a valid UHop Hits@1 result, because a fixed length can overrun the true answer. The diagnostic writes `valid_navigation_no_td.jsonl` and `valid_navigation_no_td.summary.json` rather than overwriting the default evaluation. The JSON summary explicitly warns that its answer metrics are not a valid UHop benchmark. No training objective or model weights are changed.
 
 **Caution:** Relation-frontier reachability must not be reported as Hits@1. The reported `hits_at_1` is from the stated gold-blind single-entity selector. For direct comparison with learned entity-ranking models, retain the selection-method qualifier and report the expected uniform Hits@1 and frontier size alongside it.
 

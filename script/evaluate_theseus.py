@@ -5,6 +5,7 @@ This is an inference-only wrapper. UHop itself predicts relations, not unique
 entity-edge actions. Answer-set reachability is therefore not Hits@1.
 """
 import argparse
+from collections import Counter
 import importlib
 import json
 import sys
@@ -42,73 +43,162 @@ def pad(rows, length, padding, device):
     )
 
 
+def score_actions(model, question, actions, word2id, rela2id,
+                  relation_text, args, batch_size):
+    """Score (relation, history) pairs with UHop's original shared padding.
+
+    In the original Framework._single_UHop_step, candidates at different depths
+    are packed into a single forward pass. In particular, termination compares
+    the previous chosen action (with its earlier history) and possible next
+    actions (with the updated history). Cached scores from separate passes are
+    not interchangeable because the LSTM consumes padded relation sequences.
+
+    Fixed global padding widths across chunks keep scores consistent even when
+    a large frontier requires multiple model calls.
+    """
+    if not actions:
+        return []
+    device = args.device
+    question_ids = [word2id.get(w, word2id["<unk>"])
+                    for w in question.strip().split(" ")]
+    relation_ids = []
+    relation_words = []
+    histories_ids = []
+    histories_words = []
+    for relation, history in actions:
+        ids = tokenize(relation, rela2id)
+        words = tokenize(relation_text.get(relation, relation), word2id, "._")
+        prev_ids = [tokenize(prev, rela2id) for prev in history]
+        prev_words = [
+            tokenize(relation_text.get(prev, prev), word2id, "._")
+            for prev in history
+        ]
+        if args.dynamic == "none":
+            ids = sum(prev_ids + [ids], [])
+            words = sum(prev_words + [words], [])
+        relation_ids.append(ids)
+        relation_words.append(words)
+        histories_ids.append(prev_ids)
+        histories_words.append(prev_words)
+
+    max_rel_id = max(len(ids) for ids in relation_ids)
+    max_rel_word = max(len(words) for words in relation_words)
+    depth = max(len(history) for history in histories_ids)
+    if args.dynamic == "flatten":
+        flattened_ids = [sum(history, []) for history in histories_ids]
+        flattened_words = [sum(history, []) for history in histories_words]
+        prev_id_widths = [max(map(len, flattened_ids))]
+        prev_word_widths = [max(map(len, flattened_words))]
+    elif args.dynamic == "recurrent":
+        prev_id_widths = [
+            max(len(history[step]) if step < len(history) else 0
+                for history in histories_ids)
+            for step in range(depth)
+        ]
+        prev_word_widths = [
+            max(len(history[step]) if step < len(history) else 0
+                for history in histories_words)
+            for step in range(depth)
+        ]
+    elif args.dynamic != "none":
+        raise ValueError(f"Unsupported UHop history mode: {args.dynamic}")
+
+    all_scores = []
+    for start in range(0, len(actions), batch_size):
+        stop = min(start + batch_size, len(actions))
+        width = stop - start
+        question_batch = pad(
+            [question_ids] * width, max(5, len(question_ids)),
+            word2id["PADDING"], device
+        )
+        rela_batch = pad(
+            relation_ids[start:stop], max_rel_id, rela2id["PADDING"], device
+        )
+        words_batch = pad(
+            relation_words[start:stop], max_rel_word, word2id["PADDING"], device
+        )
+        prev_batches, prev_word_batches = [], []
+        if args.dynamic == "flatten":
+            if prev_id_widths[0]:
+                prev_batches = [pad(
+                    flattened_ids[start:stop], prev_id_widths[0],
+                    rela2id["PADDING"], device
+                )]
+            if prev_word_widths[0]:
+                prev_word_batches = [pad(
+                    flattened_words[start:stop], prev_word_widths[0],
+                    word2id["PADDING"], device
+                )]
+        elif args.dynamic == "recurrent":
+            for step in range(depth):
+                prev_batches.append(pad(
+                    [history[step] if step < len(history) else []
+                     for history in histories_ids[start:stop]],
+                    prev_id_widths[step], rela2id["PADDING"], device
+                ))
+                prev_word_batches.append(pad(
+                    [history[step] if step < len(history) else []
+                     for history in histories_words[start:stop]],
+                    prev_word_widths[step], word2id["PADDING"], device
+                ))
+        scores = model(
+            question_batch, words_batch, rela_batch,
+            prev_word_batches, prev_batches
+        )
+        all_scores.extend(scores.reshape(-1).detach().cpu().tolist())
+    return all_scores
+
+
 def score_candidates(model, question, relations, history, word2id, rela2id,
                      relation_text, args, batch_size):
-    """Pack candidates exactly as Framework._single_UHop_step does."""
-    if not relations:
-        return {}
-    device = args.device
-    question_ids = [word2id.get(w, word2id["<unk>"]) for w in question.strip().split(" ")]
-    relation_ids = [tokenize(rel, rela2id) for rel in relations]
-    relation_words = [tokenize(relation_text.get(rel, rel), word2id, "._") for rel in relations]
-    previous_ids = [tokenize(rel, rela2id) for rel in history]
-    previous_words = [tokenize(relation_text.get(rel, rel), word2id, "._") for rel in history]
-    if args.dynamic == "none":
-        relation_ids = [sum(previous_ids + [rel], []) for rel in relation_ids]
-        relation_words = [sum(previous_words + [rel], []) for rel in relation_words]
-    max_rel_id = max(len(rel) for rel in relation_ids)
-    max_rel_word = max(len(rel) for rel in relation_words)
-    all_scores = []
-    for start in range(0, len(relations), batch_size):
-        stop = start + batch_size
-        width = len(relations[start:stop])
-        question_batch = pad([question_ids] * width, max(5, len(question_ids)),
-                             word2id["PADDING"], device)
-        rela_batch = pad(relation_ids[start:stop], max_rel_id,
-                         rela2id["PADDING"], device)
-        words_batch = pad(relation_words[start:stop], max_rel_word,
-                          word2id["PADDING"], device)
-        prev_batches, prev_word_batches = [], []
-        if args.dynamic == "flatten" and history:
-            flat_ids = sum(previous_ids, [])
-            flat_words = sum(previous_words, [])
-            prev_batches = [pad([flat_ids] * width, len(flat_ids),
-                                rela2id["PADDING"], device)]
-            prev_word_batches = [pad([flat_words] * width, len(flat_words),
-                                     word2id["PADDING"], device)]
-        elif args.dynamic == "recurrent":
-            prev_batches = [pad([prev] * width, len(prev),
-                                rela2id["PADDING"], device) for prev in previous_ids]
-            prev_word_batches = [pad([prev] * width, len(prev),
-                                     word2id["PADDING"], device) for prev in previous_words]
-        scores = model(question_batch, words_batch, rela_batch,
-                       prev_word_batches, prev_batches)
-        all_scores.extend(scores.reshape(-1).detach().cpu().tolist())
-    return dict(zip(relations, all_scores))
+    """Rank outgoing relations using the same scoring inputs as UHop's RC."""
+    scores = score_actions(
+        model, question, [(relation, history) for relation in relations],
+        word2id, rela2id, relation_text, args, batch_size
+    )
+    return dict(zip(relations, scores))
 
 
 def navigate(model, question, source, graph, word2id, rela2id,
              relation_text, model_args, eval_args):
     frontier = {source}
     history = []
-    previous_score = None
-    # UHop's learned TD compares best next score to the chosen previous score.
+    stop_reason = "max_hops"
     for _ in range(eval_args.max_hops):
-        choices = sorted({rel for node in frontier for rel in graph.get(node, {})})
+        choices = sorted({
+            rel for node in frontier for rel in graph.get(node, {})
+        })
         if not choices:
+            stop_reason = "no_outgoing_relations"
             break
-        scores = score_candidates(model, question, choices, history,
-                                  word2id, rela2id, relation_text, model_args, eval_args.batch_size)
-        best_relation = max(choices, key=lambda rel: scores[rel])
-        best_score = scores[best_relation]
-        if previous_score is not None and best_score <= previous_score:
-            break
+
+        # TD comes before the next RC decision. Re-score the previous action
+        # with history[:-1] and all next actions with history in the SAME
+        # padded candidate set, as Framework._termination_decision does.
+        # No gold relations or answer entities enter this comparison.
+        if history and eval_args.termination_mode == "learned":
+            actions = [(history[-1], history[:-1])]
+            actions.extend((relation, history) for relation in choices)
+            td_scores = score_actions(
+                model, question, actions, word2id, rela2id,
+                relation_text, model_args, eval_args.batch_size
+            )
+            if max(td_scores[1:]) <= td_scores[0]:
+                stop_reason = "learned_termination"
+                break
+
+        # RC is evaluated separately after TD, matching UHop's training order.
+        scores = score_candidates(
+            model, question, choices, history,
+            word2id, rela2id, relation_text, model_args, eval_args.batch_size
+        )
+        best_relation = max(choices, key=lambda relation: scores[relation])
         history.append(best_relation)
         frontier = {
-            tail for node in frontier for tail in graph.get(node, {}).get(best_relation, ())
+            tail for node in frontier
+            for tail in graph.get(node, {}).get(best_relation, ())
         }
-        previous_score = best_score
-    return history, sorted(frontier)
+    return history, sorted(frontier), stop_reason
 
 
 def extend_paraphrase_vocabulary(model, word2id, questions, source, args):
@@ -215,7 +305,7 @@ def evaluate(args):
     results = []
     with torch.no_grad():
         for index, (row, question, variant_index) in enumerate(variants, 1):
-            predicted, terminal = navigate(
+            predicted, terminal, stop_reason = navigate(
                 model, question, row["source"], graph, word2id, rela2id,
                 relation_text, original, args
             )
@@ -232,6 +322,8 @@ def evaluate(args):
                 "paraphrase_index": variant_index,
                 "hops": row["hops"],
                 "predicted_relations": predicted,
+                "stop_reason": stop_reason,
+                "predicted_hops": len(predicted),
                 "gold_relations": row["gold_relations"],
                 "relation_chain_correct": predicted == row["gold_relations"],
                 "RED": relation_edit_distance(predicted, row["gold_relations"]),
@@ -252,14 +344,34 @@ def evaluate(args):
     summary = aggregate(
         results, args.question_variant, args.entity_selector, args.seed
     )
+    summary["termination_mode"] = args.termination_mode
+    for group, records in [
+        (summary["all"], results),
+        *[(summary["by_hop"][str(hops)],
+           [row for row in results if row["hops"] == hops])
+          for hops in sorted({row["hops"] for row in results})],
+    ]:
+        group["stop_reasons"] = dict(sorted(Counter(
+            row["stop_reason"] for row in records
+        ).items()))
+        group["premature_stop_reasons"] = dict(sorted(Counter(
+            row["stop_reason"] for row in records
+            if row["predicted_hops"] < row["hops"]
+        ).items()))
+    if args.termination_mode == "ignore":
+        summary["metric_warning"] += (
+            " Termination was DISABLED in this diagnostic run. "
+            "Its answer metrics are not a valid UHop benchmark."
+        )
     if args.output:
         output = args.output
-    elif args.question_variant == "canonical":
-        output = checkpoint / f"{args.split}_navigation"
     else:
-        suffix = ("" if args.paraphrase_index == "all"
-                  else f"_{args.paraphrase_index}")
-        output = checkpoint / f"{args.split}_navigation_paraphrased{suffix}"
+        suffix = "" if args.question_variant == "canonical" else "_paraphrased"
+        if args.question_variant == "paraphrased" and args.paraphrase_index != "all":
+            suffix += f"_{args.paraphrase_index}"
+        if args.termination_mode == "ignore":
+            suffix += "_no_td"
+        output = checkpoint / f"{args.split}_navigation{suffix}"
     output.parent.mkdir(parents=True, exist_ok=True)
     with open(output.with_suffix(".jsonl"), "w", encoding="utf-8") as stream:
         for row in results:
@@ -277,6 +389,12 @@ def main():
     parser.add_argument("--split", choices=("train", "valid", "test"), default="test")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--max-hops", type=int, default=8)
+    parser.add_argument(
+        "--termination-mode", choices=("learned", "ignore"),
+        default="learned",
+        help="Original UHop joint TD by default. 'ignore' disables TD for "
+             "diagnosis only and is not a valid UHop benchmark."
+    )
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--offline-source", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
