@@ -119,6 +119,25 @@ class TheseusAdapterTests(unittest.TestCase):
                         "\n" + completed.stderr[-3000:]
                     )
                     self.assertTrue((checkpoint / "model.pth").is_file())
+                    evaluation_path = Path(tmp) / ("navigation_" + model)
+                    evaluation = subprocess.run(
+                        [
+                            sys.executable, "script/evaluate_theseus.py",
+                            "--checkpoint", str(checkpoint),
+                            "--offline-source", str(source),
+                            "--split", "test", "--device", "cpu",
+                            "--max-hops", "3", "--batch-size", "4",
+                            "--output", str(evaluation_path)
+                        ],
+                        cwd=repo, env=environment,
+                        capture_output=True, text=True, timeout=120
+                    )
+                    self.assertEqual(
+                        evaluation.returncode, 0,
+                        model + "\n" + evaluation.stdout[-3000:] +
+                        "\n" + evaluation.stderr[-3000:]
+                    )
+                    self.assertTrue(evaluation_path.with_suffix(".summary.json").is_file())
 
     def test_missing_gold_relation_fails(self):
         with self.assertRaisesRegex(ValueError, "Gold relation"):
