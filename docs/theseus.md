@@ -17,22 +17,38 @@ mkdir -p saved_model
 
 The original UHop dataset download host is suspended, so the original UHop_data.zip is not a prerequisite for these datasets.
 
-Download the pretrained Stanford [GloVe 6B](https://nlp.stanford.edu/projects/glove/) archive and extract glove.6B.300d.txt. Its embeddings are frozen, as in the original UHop implementation. The adapter stores a compact subset of the GloVe vectors for each dataset. GloVe files are not redistributed here.
+The adapter uses the 300-dimensional [NeuML/glove-6B](https://huggingface.co/NeuML/glove-6B) vectors from Hugging Face by default. It downloads only model.safetensors and vocab.json, selects words used by the released QA and relation labels, and writes compact UHop embedding files. Pretrained word vectors remain frozen, as in the original UHop implementation. It does not download the separate SQLite version or export an intermediate full-text GloVe file.
 
 ## Prepare
 
 ~~~bash
-python script/preprocess/prepare_theseus.py \
-  --dataset kinship --glove /path/to/glove.6B.300d.txt
+python script/preprocess/prepare_theseus.py --dataset kinship
 
-python script/preprocess/prepare_theseus.py \
-  --dataset mquake_st_single --glove /path/to/glove.6B.300d.txt
+python script/preprocess/prepare_theseus.py --dataset mquake_st_single
 
-python script/preprocess/prepare_theseus.py \
-  --dataset mquake_st_multi --glove /path/to/glove.6B.300d.txt
+python script/preprocess/prepare_theseus.py --dataset mquake_st_multi
 ~~~
 
-The script fetches only the corresponding KG, metadata and QA files from Hugging Face. Alternatively use --offline-source /path/to/downloaded/dataset. Pin an immutable Hugging Face revision using --revision COMMIT_SHA for reproducibility. With --output-root, pass the matching prepared directory using --data_dir when training.
+The data and embedding downloads use the standard Hugging Face cache, so the same 300d GloVe model can be reused across datasets. To make the source explicit, the default is equivalent to:
+
+~~~bash
+python script/preprocess/prepare_theseus.py \
+  --dataset kinship \
+  --glove-source huggingface \
+  --glove-model NeuML/glove-6B
+~~~
+
+For offline use or another pretrained GloVe text file, retain the original local option:
+
+~~~bash
+python script/preprocess/prepare_theseus.py \
+  --dataset kinship \
+  --glove /path/to/glove.6B.300d.txt
+~~~
+
+Supplying --glove automatically selects the local file. The Hugging Face model has only 300-dimensional vectors. To use a local 50-dimensional GloVe file, pass --emb-size 50 as well.
+
+The script fetches the corresponding KG, metadata and QA files from Hugging Face. Alternatively use --offline-source /path/to/downloaded/dataset. For reproducibility, pin --revision to the dataset commit and --glove-revision to the embedding-model commit independently. The chosen embedding source is recorded in source.json. With --output-root, pass the matching prepared directory using --data_dir when training.
 
 Output lives in the ignored data/THESEUS/DATASET/ directory:
 
