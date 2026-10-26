@@ -6,12 +6,15 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+
+import numpy as np
 from pathlib import Path
 from types import SimpleNamespace
 
 from script.preprocess.prepare_theseus import (
-    candidates_and_frontier, gold_chain, parse_answers, parse_paths, prepare,
-    read_graph,
+    candidates_and_frontier, gold_chain, make_embeddings, parse_answers,
+    parse_paths, prepare, read_graph,
 )
 
 
@@ -138,6 +141,49 @@ class TheseusAdapterTests(unittest.TestCase):
                         "\n" + evaluation.stderr[-3000:]
                     )
                     self.assertTrue(evaluation_path.with_suffix(".summary.json").is_file())
+
+    def test_huggingface_glove_vectors_and_local_fallback(self):
+        from safetensors.numpy import save_file
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_path = root / "model.safetensors"
+            vocab_path = root / "vocab.json"
+            source_vectors = np.stack([
+                np.full(300, 0.25, dtype=np.float32),
+                np.full(300, -0.75, dtype=np.float32),
+            ])
+            save_file({"vectors": source_vectors}, str(model_path))
+            vocab_path.write_text(json.dumps({
+                "tokens": {"Who": 0, "r": 1}
+            }), encoding="utf-8")
+
+            def fake_download(*, repo_id, filename, revision):
+                self.assertEqual(repo_id, "NeuML/glove-6B")
+                self.assertEqual(revision, "test-revision")
+                return str(root / filename)
+
+            with patch("huggingface_hub.hf_hub_download", side_effect=fake_download):
+                make_embeddings(
+                    root, ["Who is related?"], {"r": "r"}, None, 300,
+                    glove_source="huggingface",
+                    glove_model="NeuML/glove-6B",
+                    glove_revision="test-revision",
+                )
+                with self.assertRaisesRegex(ValueError, "dimension"):
+                    make_embeddings(
+                        root, ["Who is related?"], {"r": "r"}, None, 50,
+                        glove_source="huggingface",
+                        glove_model="NeuML/glove-6B",
+                        glove_revision="test-revision",
+                    )
+
+            word2id = json.loads((root / "word2id.json").read_text())
+            matrix = np.load(root / "word_emb.npy")
+            self.assertEqual(matrix.shape[1], 300)
+            np.testing.assert_array_equal(matrix[word2id["Who"]], source_vectors[0])
+            np.testing.assert_array_equal(matrix[word2id["r"]], source_vectors[1])
+            np.testing.assert_array_equal(matrix[word2id["is"]], np.zeros(300))
 
     def test_missing_gold_relation_fails(self):
         with self.assertRaisesRegex(ValueError, "Gold relation"):

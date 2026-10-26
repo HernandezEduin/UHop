@@ -161,7 +161,9 @@ def read_relation_text(dataset, offline_source, revision, relations):
     return texts
 
 
-def make_embeddings(directory, questions, relation_text, glove, dim):
+def make_embeddings(directory, questions, relation_text, glove, dim,
+                    glove_source="local", glove_model="NeuML/glove-6B",
+                    glove_revision="main"):
     words = set()
     for question in questions:
         words.update(question.strip().split(" "))
@@ -172,26 +174,70 @@ def make_embeddings(directory, questions, relation_text, glove, dim):
     word2id = {"PADDING": 0, "<unk>": 1}
     word2id.update({word: index for index, word in enumerate(sorted(words), 2)})
     weights = np.zeros((len(word2id), dim), dtype=np.float32)
-    found = 0
-    with open(glove, encoding="utf-8") as stream:
-        for line in stream:
-            fields = line.rstrip().split(" ")
-            if len(fields) != dim + 1:
+
+    if glove_source == "local":
+        if glove is None:
+            raise ValueError("--glove is required with --glove-source local")
+        found = 0
+        with open(glove, encoding="utf-8") as stream:
+            for line in stream:
+                fields = line.rstrip().split(" ")
+                if len(fields) != dim + 1:
+                    continue
+                index = word2id.get(fields[0])
+                if index is not None and index > 1:
+                    weights[index] = np.asarray(fields[1:], dtype=np.float32)
+                    found += 1
+    elif glove_source == "huggingface":
+        try:
+            from huggingface_hub import hf_hub_download
+            from safetensors.numpy import load_file
+        except ImportError as exc:
+            raise RuntimeError(
+                "Install the adapter dependencies: pip install -r requirements-theseus.txt"
+            ) from exc
+
+        model_path = hf_hub_download(
+            repo_id=glove_model, filename="model.safetensors",
+            revision=glove_revision
+        )
+        vocab_path = hf_hub_download(
+            repo_id=glove_model, filename="vocab.json",
+            revision=glove_revision
+        )
+        with open(vocab_path, encoding="utf-8") as stream:
+            tokens = json.load(stream)["tokens"]
+        # Safetensors loads through mmap, so the full 300d vectors need not be
+        # exported to a temporary text file before selecting dataset tokens.
+        vectors = load_file(model_path)["vectors"]
+        if vectors.ndim != 2 or vectors.shape[1] != dim:
+            raise ValueError(
+                f"{glove_model} has vector dimension {vectors.shape}, "
+                f"but --emb-size is {dim}"
+            )
+        found = 0
+        for word, index in word2id.items():
+            if index < 2:
                 continue
-            index = word2id.get(fields[0])
-            if index is not None and index > 1:
-                weights[index] = np.asarray(fields[1:], dtype=np.float32)
-                found += 1
+            source_index = tokens.get(word)
+            if source_index is None:
+                continue
+            if not isinstance(source_index, int) or not 0 <= source_index < len(vectors):
+                raise ValueError(f"Invalid vocabulary index for {word!r}")
+            weights[index] = vectors[source_index]
+            found += 1
+    else:
+        raise ValueError(f"Unknown GloVe source: {glove_source}")
+
     if not found:
         raise ValueError(
-            f"No vocabulary tokens matched {glove}. Check --emb-size and GloVe variant."
+            f"No GloVe vocabulary tokens matched ({glove_source}, {dim}d)."
         )
     (directory / "word2id.json").write_text(
         json.dumps(word2id, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     np.save(directory / "word_emb.npy", weights)
     print(f"GloVe coverage: {found}/{len(word2id) - 2} tokens ({dim}d)")
-
 
 def prepare(args):
     dataset = args.dataset
@@ -268,7 +314,19 @@ def prepare(args):
         with open(destination / f"{split}_metadata.jsonl", "w", encoding="utf-8") as stream:
             for metadata in split_metadata[split]:
                 stream.write(json.dumps(metadata, ensure_ascii=False) + "\n")
-    make_embeddings(destination, questions, texts, args.glove, args.emb_size)
+    glove_source = getattr(args, "glove_source", "auto")
+    glove_path = getattr(args, "glove", None)
+    if glove_source == "auto":
+        glove_source = "local" if glove_path else "huggingface"
+    if glove_source == "huggingface" and glove_path:
+        raise ValueError("Use --glove-source local with --glove")
+    glove_model = getattr(args, "glove_model", "NeuML/glove-6B")
+    glove_revision = getattr(args, "glove_revision", "main")
+    make_embeddings(
+        destination, questions, texts, glove_path, args.emb_size,
+        glove_source=glove_source, glove_model=glove_model,
+        glove_revision=glove_revision
+    )
     (destination / "source.json").write_text(
         json.dumps({
             "dataset": dataset,
@@ -280,6 +338,10 @@ def prepare(args):
             "triple_count": len(triples),
             "question_counts": {s: len(split_examples[s]) for s in ("train", "valid", "test")},
             "format": "UHop relation choices, not entity-edge labels",
+            "glove_source": glove_source,
+            "glove_model": glove_model if glove_source == "huggingface" else None,
+            "glove_revision": glove_revision if glove_source == "huggingface" else None,
+            "glove_dimensions": args.emb_size,
         }, indent=2), encoding="utf-8"
     )
     print(f"Prepared {dataset} at {destination}")
@@ -289,8 +351,15 @@ def prepare(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True, choices=sorted(DATASETS))
-    parser.add_argument("--glove", type=Path, required=True,
-                        help="Extracted Stanford GloVe .txt of matching dimension")
+    parser.add_argument("--glove", type=Path, default=None,
+                        help="Optional local Stanford GloVe .txt, used as offline fallback")
+    parser.add_argument("--glove-source", choices=("auto", "huggingface", "local"),
+                        default="auto",
+                        help="Default auto uses Hugging Face, or local when --glove is supplied")
+    parser.add_argument("--glove-model", default="NeuML/glove-6B",
+                        help="Hugging Face model with vocab.json and model.safetensors")
+    parser.add_argument("--glove-revision", default="main",
+                        help="Pin the GloVe model revision independently of the dataset")
     parser.add_argument("--emb-size", type=int, default=300, choices=(50, 300))
     parser.add_argument("--revision", default="main",
                         help="Hugging Face revision. Pin a commit for reproducibility.")
