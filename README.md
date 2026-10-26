@@ -2,6 +2,10 @@
 
 This is the code for our UHop [paper](https://arxiv.org/abs/1904.01246). 
 
+## THESEUS datasets
+
+Kinship and MQuAKE-ST can now be prepared and run with UHop's original relation-ranking and stop/continue training. See [THESEUS dataset setup and evaluation](docs/theseus.md). The adapter keeps relation-only UHop predictions distinct from entity-level graph navigation.
+
 ## Getting Started
 
 To train and evaluate this code:

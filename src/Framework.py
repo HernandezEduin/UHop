@@ -23,6 +23,7 @@ class Framework():
         self.rela2id = rela2id
         self.id2rela = {v:k for k,v in rela2id.items()}
         self.framework = args.framework
+        self.device = getattr(args, 'device', 'cuda')
 
     def _set_optimizer(self, model):
         if self.args.optimizer == 'adam':
@@ -39,7 +40,7 @@ class Framework():
     def _eval_metric(self, scores):
         pos_scores = scores[0].repeat(len(scores)-1)
         neg_scores = scores[1:]
-        ones = torch.ones(len(neg_scores)).cuda()
+        ones = torch.ones(len(neg_scores)).to(self.device)
         loss = self.loss_function(pos_scores, neg_scores, ones)
         acc = 1 if all([x > y for x, y in zip(pos_scores, neg_scores)]) else 0
         return loss, acc
@@ -64,8 +65,8 @@ class Framework():
                 if start_position != None:
                     position.append([0]*(maxlen-len(seq)) + [i+start_position for i in range(len(seq))])
         if start_position == None:
-            return torch.LongTensor(pad_seq).cuda(), torch.LongTensor(mask).cuda()
-        return torch.LongTensor(pad_seq).cuda(), torch.LongTensor(mask).cuda(), torch.LongTensor(position).cuda()
+            return torch.LongTensor(pad_seq).to(self.device), torch.LongTensor(mask).to(self.device)
+        return torch.LongTensor(pad_seq).to(self.device), torch.LongTensor(mask).to(self.device), torch.LongTensor(position).to(self.device)
 
     def _single_UHop_step(self, model, ques, pos_tuples, neg_tuples):
         pos_rela, pos_rela_text, pos_prev, pos_prev_text, _ = zip(*pos_tuples)
@@ -183,7 +184,7 @@ class Framework():
 
     def _execute_UHop(self, model, data, mode):
         index, ques, step_list = data
-        loss = torch.tensor(0, dtype=torch.float, requires_grad=True).cuda()
+        loss = torch.tensor(0, dtype=torch.float, requires_grad=True).to(self.device)
         loss_count, step_count = 0, 0
         acc_list = []
         if mode == 'train':
@@ -256,13 +257,13 @@ class Framework():
         else:
             train_dataset = dataset
             valid_dataset = PerQuestionDataset(self.args, 'valid', self.word2id, self.rela2id)
-        datas = DataLoader(dataset=train_dataset, batch_size=1, shuffle=True, num_workers=18, 
+        datas = DataLoader(dataset=train_dataset, batch_size=1, shuffle=True, num_workers=self.args.num_workers, 
                 pin_memory=False, collate_fn=quick_collate)
         self._set_optimizer(model)
         earlystop_counter, min_valid_metric = 0, 100
         # training
         for epoch in range(0, self.args.epoch_num):
-            model = model.train().cuda()
+            model = model.train().to(self.device)
             total_loss, total_acc = 0.0, 0.0
             loss_count, acc_count = 0, 0
             total_rc_acc, total_td_acc = 0.0, 0.0
@@ -299,12 +300,12 @@ class Framework():
 
     def evaluate(self, model, mode, dataset, output_result=False):
         if model == None:
-            model = self.args.Model(self.args).cuda()
+            model = self.args.Model(self.args).to(self.device)
             model = load_model(model, self.args.path)
-        model = model.eval().cuda()
+        model = model.eval().to(self.device)
         if dataset == None:
             dataset = PerQuestionDataset(self.args, mode, self.word2id, self.rela2id)
-        datas = DataLoader(dataset=dataset, batch_size=1, shuffle=False, num_workers=12, 
+        datas = DataLoader(dataset=dataset, batch_size=1, shuffle=False, num_workers=self.args.num_workers, 
                 pin_memory=False, collate_fn=quick_collate)
         total_loss, total_acc, total_rc_acc, total_td_acc = 0.0, 0.0, 0.0, 0.0
         loss_count, acc_count, rc_count, td_count = 0, 0, 0, 0

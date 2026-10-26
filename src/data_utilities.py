@@ -5,6 +5,7 @@ import operator
 from torch.utils.data import DataLoader, Dataset
 import torch
 import json
+import os
 from functools import reduce
 from itertools import accumulate
 import random
@@ -14,6 +15,8 @@ U_PATH, B_PATH = {}, {}
 U_PATH['wq'] = '../data/WQ/main_exp'
 U_PATH['wq_train1test2'] = '../data/WQ/train1test2_exp'
 U_PATH['sq'] = '../data/SQ'
+for dataset in ('kinship', 'mquake_st_single', 'mquake_st_multi'):
+    U_PATH[dataset] = f'../data/THESEUS/{dataset}'
 for i in [1,2,3]:
     U_PATH[f'pq{i}'] = f'../data/PQ/PQ{i}'
     U_PATH[f'pql{i}'] = f'../data/PQ/PQL{i}'
@@ -54,11 +57,16 @@ class Subset(Dataset):
 class PerQuestionDataset(Dataset):
     def __init__(self, args, mode, word2id, rela2id):
         super(PerQuestionDataset, self).__init__()
+        self.relation_text_by_id = {}
         self.data_objs = self._get_data(args, mode, word2id, rela2id)
     def _get_data(self, args, mode, word2id, rela2id):
         data_objs = []
         if args.framework == 'UHop':
-            file_path = U_PATH[args.dataset]
+            file_path = getattr(args, 'data_dir', None) or U_PATH[args.dataset.lower()]
+            relation_text_path = os.path.join(file_path, 'relation_text.json')
+            if os.path.exists(relation_text_path):
+                with open(relation_text_path, encoding='utf-8') as text_file:
+                    self.relation_text_by_id = json.load(text_file)
             print(file_path)
             with open(f'{file_path}/{mode}_data.txt', 'r') as f:
                 for i, line in enumerate(f):
@@ -93,9 +101,9 @@ class PerQuestionDataset(Dataset):
             tuples = []
             for t in step_list[0]:
                 num_rela = self._numericalize_str(t[0], rela2id, ['.'])
-                num_rela_text = self._numericalize_str(t[0], word2id, ['.', '_'])
+                num_rela_text = self._numericalize_str(self.relation_text_by_id.get(t[0], t[0]), word2id, ['.', '_'])
                 num_prev = [self._numericalize_str(prev, rela2id, ['.']) for prev in t[1]]
-                num_prev_text = [self._numericalize_str(prev, word2id, ['.', '_']) for prev in t[1]]
+                num_prev_text = [self._numericalize_str(self.relation_text_by_id.get(prev, prev), word2id, ['.', '_']) for prev in t[1]]
                 tuples.append((num_rela, num_rela_text, num_prev, num_prev_text, t[2]))
             new_step_list = tuples
         else:
@@ -104,9 +112,9 @@ class PerQuestionDataset(Dataset):
                 new_step = []
                 for t in step:
                     num_rela = self._numericalize_str(t[0], rela2id, ['.'])
-                    num_rela_text = self._numericalize_str(t[0], word2id, ['.', '_'])
+                    num_rela_text = self._numericalize_str(self.relation_text_by_id.get(t[0], t[0]), word2id, ['.', '_'])
                     num_prev = [self._numericalize_str(prev, rela2id, ['.']) for prev in t[1]]
-                    num_prev_text = [self._numericalize_str(prev, word2id, ['.', '_']) for prev in t[1]]
+                    num_prev_text = [self._numericalize_str(self.relation_text_by_id.get(prev, prev), word2id, ['.', '_']) for prev in t[1]]
                     new_step.append((num_rela, num_rela_text, num_prev, num_prev_text, t[2]))
                 new_step_list.append(new_step)
         return index, ques, new_step_list

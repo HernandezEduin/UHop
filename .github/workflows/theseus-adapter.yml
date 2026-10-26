@@ -1,0 +1,22 @@
+name: THESEUS adapter tests
+
+on:
+  push:
+    branches:
+      - feature/theseus-datasets
+  pull_request:
+    paths:
+      - "script/preprocess/prepare_theseus.py"
+      - "tests/test_theseus_adapter.py"
+      - ".github/workflows/theseus-adapter.yml"
+
+jobs:
+  conversion-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install "numpy>=1.22,<3"
+      - run: python -m unittest discover -s tests -v
