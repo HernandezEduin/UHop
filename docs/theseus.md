@@ -48,6 +48,10 @@ python script/preprocess/prepare_theseus.py \
 
 Supplying --glove automatically selects the local file. The Hugging Face model has only 300-dimensional vectors. To use a local 50-dimensional GloVe file, pass --emb-size 50 as well.
 
+For either embedding source, each UHop vocabulary token first looks for an exact GloVe match, then a lowercase match, then a lowercase match after removing punctuation at token boundaries. This helps initialize words such as "Who" and "related?" without altering the input vocabulary, tokenization, model, or training methodology. Remaining out-of-vocabulary tokens retain zero-initialized pretrained vectors.
+
+Preprocessing prints both unique-token coverage and token-occurrence coverage. The latter counts occurrences across the prepared questions and one copy of each relation label, not the frequency of relation candidates during training. Neither statistic measures KG entity or relation embedding coverage.
+
 The script fetches the corresponding KG, metadata and QA files from Hugging Face. Alternatively use --offline-source /path/to/downloaded/dataset. For reproducibility, pin --revision to the dataset commit and --glove-revision to the embedding-model commit independently. The chosen embedding source is recorded in source.json. With --output-root, pass the matching prepared directory using --data_dir when training.
 
 Output lives in the ignored data/THESEUS/DATASET/ directory:

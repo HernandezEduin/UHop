@@ -152,10 +152,12 @@ class TheseusAdapterTests(unittest.TestCase):
             source_vectors = np.stack([
                 np.full(300, 0.25, dtype=np.float32),
                 np.full(300, -0.75, dtype=np.float32),
+                np.full(300, 0.125, dtype=np.float32),
+                np.full(300, 0.5, dtype=np.float32),
             ])
             save_file({"vectors": source_vectors}, str(model_path))
             vocab_path.write_text(json.dumps({
-                "tokens": {"Who": 0, "r": 1}
+                "tokens": {"who": 0, "r": 1, "related": 2, "Who": 3}
             }), encoding="utf-8")
 
             def fake_download(*, repo_id, filename, revision):
@@ -164,12 +166,19 @@ class TheseusAdapterTests(unittest.TestCase):
                 return str(root / filename)
 
             with patch("huggingface_hub.hf_hub_download", side_effect=fake_download):
-                make_embeddings(
-                    root, ["Who is related?"], {"r": "r"}, None, 300,
-                    glove_source="huggingface",
-                    glove_model="NeuML/glove-6B",
-                    glove_revision="test-revision",
-                )
+                with patch("builtins.print") as prints:
+                    make_embeddings(
+                        root, ["Who Who WHO is related?"], {"r": "r"}, None, 300,
+                        glove_source="huggingface",
+                        glove_model="NeuML/glove-6B",
+                        glove_revision="test-revision",
+                    )
+                messages = [call.args[0] for call in prints.call_args_list]
+                self.assertIn("GloVe coverage: 4/5 unique tokens (300d)", messages)
+                self.assertTrue(any(
+                    message.startswith("GloVe occurrence coverage: 5/6 ")
+                    for message in messages
+                ))
                 with self.assertRaisesRegex(ValueError, "dimension"):
                     make_embeddings(
                         root, ["Who is related?"], {"r": "r"}, None, 50,
@@ -181,9 +190,34 @@ class TheseusAdapterTests(unittest.TestCase):
             word2id = json.loads((root / "word2id.json").read_text())
             matrix = np.load(root / "word_emb.npy")
             self.assertEqual(matrix.shape[1], 300)
-            np.testing.assert_array_equal(matrix[word2id["Who"]], source_vectors[0])
+            # Exact mixed-case matches take priority over lowercase matches.
+            np.testing.assert_array_equal(matrix[word2id["Who"]], source_vectors[3])
+            np.testing.assert_array_equal(matrix[word2id["WHO"]], source_vectors[0])
+            np.testing.assert_array_equal(matrix[word2id["related?"]], source_vectors[2])
             np.testing.assert_array_equal(matrix[word2id["r"]], source_vectors[1])
             np.testing.assert_array_equal(matrix[word2id["is"]], np.zeros(300))
+
+    def test_local_glove_fallback_and_exact_precedence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            glove = root / "glove.3d.txt"
+            glove.write_text(
+                "Who 0.4 0.4 0.4\n"
+                "who 0.1 0.2 0.3\n"
+                "related 0.3 0.2 0.1\n"
+                "r 0.6 0.7 0.8\n",
+                encoding="utf-8",
+            )
+            make_embeddings(
+                root, ["Who WHO related?"], {"r": "r"}, glove, 3,
+                glove_source="local",
+            )
+            word2id = json.loads((root / "word2id.json").read_text())
+            matrix = np.load(root / "word_emb.npy")
+            np.testing.assert_allclose(matrix[word2id["Who"]], [0.4, 0.4, 0.4])
+            np.testing.assert_allclose(matrix[word2id["WHO"]], [0.1, 0.2, 0.3])
+            np.testing.assert_allclose(matrix[word2id["related?"]], [0.3, 0.2, 0.1])
+            np.testing.assert_allclose(matrix[word2id["r"]], [0.6, 0.7, 0.8])
 
     def test_missing_gold_relation_fails(self):
         with self.assertRaisesRegex(ValueError, "Gold relation"):

@@ -9,7 +9,8 @@ import ast
 import csv
 import json
 import re
-from collections import defaultdict
+import string
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -161,33 +162,62 @@ def read_relation_text(dataset, offline_source, revision, relations):
     return texts
 
 
+GLOVE_EDGE_PUNCTUATION = string.punctuation + "‘’“”«»…"
+
+
+def glove_lookup_forms(token):
+    """Try exact GloVe tokens before case and boundary-punctuation fallbacks."""
+    lowercase = token.lower()
+    stripped = lowercase.strip(GLOVE_EDGE_PUNCTUATION)
+    return tuple(dict.fromkeys(
+        form for form in (token, lowercase, stripped) if form
+    ))
+
+
 def make_embeddings(directory, questions, relation_text, glove, dim,
                     glove_source="local", glove_model="NeuML/glove-6B",
                     glove_revision="main"):
-    words = set()
+    # Match the original UHop tokenization without rewriting model inputs.
+    occurrences = Counter()
     for question in questions:
-        words.update(question.strip().split(" "))
+        occurrences.update(question.strip().split(" "))
     for title in relation_text.values():
-        words.update(title.replace("_", ".").split("."))
-    words.discard("PADDING")
-    words.discard("<unk>")
+        occurrences.update(title.replace("_", ".").split("."))
+    words = set(occurrences) - {"PADDING", "<unk>"}
     word2id = {"PADDING": 0, "<unk>": 1}
     word2id.update({word: index for index, word in enumerate(sorted(words), 2)})
     weights = np.zeros((len(word2id), dim), dtype=np.float32)
 
+    matched = set()
     if glove_source == "local":
         if glove is None:
             raise ValueError("--glove is required with --glove-source local")
-        found = 0
+        # A streamed text file may place a fallback before an exact match.
+        # Keep the best match for each token regardless of file order.
+        targets = defaultdict(list)
+        for word, index in word2id.items():
+            if index < 2:
+                continue
+            for priority, form in enumerate(glove_lookup_forms(word)):
+                targets[form].append((index, priority))
+        best_priority = {}
         with open(glove, encoding="utf-8") as stream:
             for line in stream:
                 fields = line.rstrip().split(" ")
                 if len(fields) != dim + 1:
                     continue
-                index = word2id.get(fields[0])
-                if index is not None and index > 1:
-                    weights[index] = np.asarray(fields[1:], dtype=np.float32)
-                    found += 1
+                matches = [
+                    (index, priority)
+                    for index, priority in targets.get(fields[0], ())
+                    if priority < best_priority.get(index, 3)
+                ]
+                if not matches:
+                    continue
+                vector = np.asarray(fields[1:], dtype=np.float32)
+                for index, priority in matches:
+                    weights[index] = vector
+                    best_priority[index] = priority
+        matched.update(best_priority)
     elif glove_source == "huggingface":
         try:
             from huggingface_hub import hf_hub_download
@@ -215,20 +245,24 @@ def make_embeddings(directory, questions, relation_text, glove, dim,
                 f"{glove_model} has vector dimension {vectors.shape}, "
                 f"but --emb-size is {dim}"
             )
-        found = 0
         for word, index in word2id.items():
             if index < 2:
                 continue
-            source_index = tokens.get(word)
+            source_index = None
+            for form in glove_lookup_forms(word):
+                source_index = tokens.get(form)
+                if source_index is not None:
+                    break
             if source_index is None:
                 continue
             if not isinstance(source_index, int) or not 0 <= source_index < len(vectors):
                 raise ValueError(f"Invalid vocabulary index for {word!r}")
             weights[index] = vectors[source_index]
-            found += 1
+            matched.add(index)
     else:
         raise ValueError(f"Unknown GloVe source: {glove_source}")
 
+    found = len(matched)
     if not found:
         raise ValueError(
             f"No GloVe vocabulary tokens matched ({glove_source}, {dim}d)."
@@ -237,7 +271,20 @@ def make_embeddings(directory, questions, relation_text, glove, dim,
         json.dumps(word2id, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     np.save(directory / "word_emb.npy", weights)
-    print(f"GloVe coverage: {found}/{len(word2id) - 2} tokens ({dim}d)")
+    matched_occurrences = sum(
+        count for token, count in occurrences.items()
+        if word2id[token] in matched
+    )
+    total_occurrences = sum(
+        count for token, count in occurrences.items()
+        if token in words
+    )
+    print(f"GloVe coverage: {found}/{len(words)} unique tokens ({dim}d)")
+    print(
+        f"GloVe occurrence coverage: {matched_occurrences}/{total_occurrences} "
+        "token occurrences (QA questions and relation labels)"
+    )
+
 
 def prepare(args):
     dataset = args.dataset
