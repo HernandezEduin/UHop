@@ -48,10 +48,6 @@ python script/preprocess/prepare_theseus.py \
 
 Supplying --glove automatically selects the local file. The Hugging Face model has only 300-dimensional vectors. To use a local 50-dimensional GloVe file, pass --emb-size 50 as well.
 
-For either embedding source, each UHop vocabulary token first looks for an exact GloVe match, then a lowercase match, then a lowercase match after removing punctuation at token boundaries. This helps initialize words such as "Who" and "related?" without altering the input vocabulary, tokenization, model, or training methodology. Remaining out-of-vocabulary tokens retain zero-initialized pretrained vectors.
-
-Preprocessing prints both unique-token coverage and token-occurrence coverage. The latter counts occurrences across the prepared questions and one copy of each relation label, not the frequency of relation candidates during training. Neither statistic measures KG entity or relation embedding coverage.
-
 The script fetches the corresponding KG, metadata and QA files from Hugging Face. Alternatively use --offline-source /path/to/downloaded/dataset. For reproducibility, pin --revision to the dataset commit and --glove-revision to the embedding-model commit independently. The chosen embedding source is recorded in source.json. With --output-root, pass the matching prepared directory using --data_dir when training.
 
 Output lives in the ignored data/THESEUS/DATASET/ directory:
@@ -102,6 +98,37 @@ It uses the original trained scoring model and the same RC/TD comparisons to cho
 - Answer reachability: at least one gold entity in the terminal relation-derived frontier
 - Answer-set exact match and mean terminal frontier size
 
-**These metrics are not entity-level Hits@1, PED or F1_SG.** One selected relation can traverse to many KG entities, and the original UHop policy does not disambiguate among their outgoing edges. The wrapper preserves those possibilities as a set. An entity-level navigation baseline would require an explicit entity-edge policy or a separately specified entity disambiguator, which would change the experimental method. Do not compare relation-frontier reachability directly against THESEUS entity-navigation Hits@1.
+### Gold-blind entity Hits@1 and relation-fidelity diagnostics
+
+UHop does not rank individual entities reached by a relation chain. For an explicit single-answer evaluation, the wrapper now samples **one** entity uniformly from the terminal frontier, using a stable hash of the dataset, question ID, variant index, and seed. This produces a reproducible single-entity `hits_at_1`. The alternative `--entity-selector first` chooses the lexicographically first entity as a deterministic tie-breaking convention. Neither selection is a learned UHop entity ranking.
+
+The report also includes `expected_hits_at_1_uniform` (the exact success probability under uniform tie-breaking), `answer_reachability` (an oracle upper bound, not Hits@1), `RED` (ordered relation edit distance), and `F1_REL` (order-invariant relation-type overlap). Thus, `hits_at_1` represents **UHop plus an explicitly identified gold-blind answer selector**. It can be compared numerically with single-entity Hits@1, but is not an identical scoring mechanism to a model that learns entity ranks. PED and F1_SG remain unavailable because the predicted relation chain may induce multiple valid entity trajectories.
+
+From the repository root, run canonical test questions:
+
+~~~bash
+python script/evaluate_theseus.py \
+  --checkpoint saved_model/HR_BiLSTM_plus_1 \
+  --split test --max-hops 3 --device cuda \
+  --entity-selector uniform --seed 42
+~~~
+
+To evaluate the released `Question-Paraphrased` lists without retraining:
+
+~~~bash
+python script/evaluate_theseus.py \
+  --checkpoint saved_model/HR_BiLSTM_plus_1 \
+  --split test --max-hops 3 --device cuda \
+  --question-variant paraphrased --paraphrase-index all \
+  --entity-selector uniform --seed 42
+~~~
+
+The `--question-variant canonical` default uses the released `Question` field. `paraphrased` evaluates every string in the `Question-Paraphrased` list, keeping the question ID and reference answers unchanged. Use `--paraphrase-index 0` to evaluate only the first paraphrase per question (zero-based). Summary counts distinguish original questions from evaluated variants. Per-hop metrics are means over evaluated variants. For MQuAKE-ST use `--max-hops 4`.
+
+Paraphrases may introduce tokens absent from the canonical-only prepared vocabulary. To avoid silently treating every new word as unknown, the evaluator **appends frozen GloVe vectors for unseen paraphrase tokens after loading the checkpoint**, retaining every original token ID and all trained weights. The existing Hugging Face GloVe cache is reused. If the checkpoint was prepared from a local text GloVe file, pass `--glove /path/to/glove.6B.300d.txt` for paraphrase evaluation. This inference-time vocabulary extension does not change UHop's training procedure.
+
+The canonical output remains `test_navigation.jsonl` and `test_navigation.summary.json`. Paraphrase evaluation saves to distinct `test_navigation_paraphrased.*` files by default, or to an explicit `--output` prefix.
+
+**Caution:** Relation-frontier reachability must not be reported as Hits@1. The reported `hits_at_1` is from the stated gold-blind single-entity selector. For direct comparison with learned entity-ranking models, retain the selection-method qualifier and report the expected uniform Hits@1 and frontier size alongside it.
 
 The original UHop paper is [Chen et al., NAACL 2019](https://aclanthology.org/N19-1031/). Please also cite the [THESEUS paper](https://arxiv.org/abs/2609.14528) and the dataset upstream sources.

@@ -55,14 +55,17 @@ class TheseusAdapterTests(unittest.TestCase):
             qa_file = source / "qa" / "kinship_qa_nhop.csv"
             with open(qa_file, "w", newline="", encoding="utf-8") as stream:
                 writer = csv.DictWriter(stream, fieldnames=[
-                    "Question-Number", "Question", "Source-Entity", "Answer-Entity",
-                    "Paths", "Hops", "SplitLabel"
+                    "Question-Number", "Question", "Question-Paraphrased",
+                    "Source-Entity", "Answer-Entity", "Paths", "Hops", "SplitLabel"
                 ])
                 writer.writeheader()
                 for i, split in enumerate(("train", "dev", "test"), 1):
                     writer.writerow({
                         "Question-Number": i,
                         "Question": "Who is related to a?",
+                        "Question-Paraphrased": repr([
+                            "Who is connected to a?", "Who is associated with a?"
+                        ]),
                         "Source-Entity": "a",
                         "Answer-Entity": "d",
                         "Paths": "[['a', 'r', 'b'], ['b', 's', 'd']]",
@@ -141,6 +144,42 @@ class TheseusAdapterTests(unittest.TestCase):
                         "\n" + evaluation.stderr[-3000:]
                     )
                     self.assertTrue(evaluation_path.with_suffix(".summary.json").is_file())
+                    summary = json.loads(
+                        evaluation_path.with_suffix(".summary.json").read_text()
+                    )
+                    self.assertIn("hits_at_1", summary["all"])
+                    self.assertIn("expected_hits_at_1_uniform", summary["all"])
+                    self.assertIn("RED", summary["all"])
+                    self.assertIn("F1_REL", summary["all"])
+                    paraphrase_output = Path(tmp) / ("paraphrase_" + model)
+                    paraphrase_test = subprocess.run(
+                        [
+                            sys.executable, "script/evaluate_theseus.py",
+                            "--checkpoint", str(checkpoint),
+                            "--offline-source", str(source),
+                            "--split", "test", "--device", "cpu",
+                            "--max-hops", "3", "--batch-size", "4",
+                            "--question-variant", "paraphrased",
+                            "--paraphrase-index", "all",
+                            "--glove", str(glove),
+                            "--output", str(paraphrase_output),
+                        ],
+                        cwd=repo, env=environment,
+                        capture_output=True, text=True, timeout=120
+                    )
+                    self.assertEqual(
+                        paraphrase_test.returncode, 0,
+                        model + "\n" + paraphrase_test.stdout[-3000:] +
+                        "\n" + paraphrase_test.stderr[-3000:]
+                    )
+                    para_summary = json.loads(
+                        paraphrase_output.with_suffix(".summary.json").read_text()
+                    )
+                    self.assertEqual(para_summary["all"]["question_count"], 1)
+                    self.assertEqual(para_summary["all"]["count"], 2)
+                    self.assertEqual(
+                        para_summary["question_variant"], "paraphrased"
+                    )
 
     def test_huggingface_glove_vectors_and_local_fallback(self):
         from safetensors.numpy import save_file

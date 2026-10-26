@@ -8,14 +8,20 @@ import argparse
 import importlib
 import json
 import sys
-from collections import defaultdict
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import torch
 
-from preprocess.prepare_theseus import read_graph
+from preprocess.prepare_theseus import (
+    make_embeddings, read_graph, read_release_file,
+)
+from theseus_evaluation_metrics import (
+    aggregate, expected_uniform_hits_at_1, load_paraphrases, question_variants,
+    relation_edit_distance, relation_f1, select_entity,
+)
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -105,28 +111,46 @@ def navigate(model, question, source, graph, word2id, rela2id,
     return history, sorted(frontier)
 
 
-def aggregate(results):
-    def one_group(rows):
-        count = len(rows)
-        return {
-            "count": count,
-            "relation_chain_accuracy": sum(r["relation_chain_correct"] for r in rows) / count,
-            "answer_reachability": sum(r["answer_reachable"] for r in rows) / count,
-            "answer_set_exact_match": sum(r["answer_set_exact"] for r in rows) / count,
-            "mean_terminal_frontier_size": sum(r["terminal_frontier_size"] for r in rows) / count,
-        }
-    by_hop = defaultdict(list)
-    for result in results:
-        by_hop[str(result["hops"])].append(result)
-    return {
-        "all": one_group(results),
-        "by_hop": {hop: one_group(rows) for hop, rows in sorted(by_hop.items())},
-        "metric_warning": (
-            "Answer reachability means any gold entity remains in the terminal "
-            "frontier. It is not Hits@1, because UHop predicts relations rather "
-            "than choosing one entity edge."
-        ),
+def extend_paraphrase_vocabulary(model, word2id, questions, source, args):
+    """Append frozen GloVe vectors for unseen paraphrase tokens after loading the checkpoint.
+
+    Existing word IDs and all trained weights remain unchanged.
+    """
+    needed = {
+        token for question in questions for token in question.strip().split(" ")
+        if token not in word2id
     }
+    if not needed:
+        print("Paraphrase vocabulary already covered by the checkpoint.")
+        return
+    glove_source = source.get("glove_source", "huggingface")
+    if glove_source == "local" and args.glove is None:
+        raise ValueError(
+            "This checkpoint uses local GloVe. Pass --glove /path/to/glove.txt "
+            "to initialize unseen paraphrase tokens."
+        )
+    with tempfile.TemporaryDirectory(prefix="uhop-paraphrase-") as temp:
+        directory = Path(temp)
+        make_embeddings(
+            directory, questions, {}, args.glove,
+            model.word_embedding.weight.shape[1],
+            glove_source=glove_source,
+            glove_model=source.get("glove_model") or "NeuML/glove-6B",
+            glove_revision=source.get("glove_revision") or "main",
+        )
+        lookup = json.loads((directory / "word2id.json").read_text(encoding="utf-8"))
+        vectors = np.load(directory / "word_emb.npy")
+        new_tokens = sorted(needed)
+        extra = vectors[[lookup[token] for token in new_tokens]].copy()
+    previous = model.word_embedding.weight.detach()
+    additional = torch.from_numpy(extra).to(device=previous.device, dtype=previous.dtype)
+    model.word_embedding = torch.nn.Embedding.from_pretrained(
+        torch.cat((previous, additional), dim=0), freeze=True
+    )
+    word2id.update({
+        token: index for index, token in enumerate(new_tokens, len(word2id))
+    })
+    print(f"Added {len(new_tokens)} frozen paraphrase tokens at inference time.")
 
 
 def evaluate(args):
@@ -173,21 +197,50 @@ def evaluate(args):
         rows = rows[:args.limit]
     if not rows:
         raise ValueError("Evaluation split is empty")
+    if args.question_variant == "paraphrased":
+        qa_path = read_release_file(
+            dataset, source["qa_file"], args.offline_source, source["revision"]
+        )
+        with open(qa_path, encoding="utf-8-sig", newline="") as stream:
+            paraphrases = load_paraphrases(stream, rows)
+    else:
+        paraphrases = None
+    variants = question_variants(
+        rows, args.question_variant, paraphrases, args.paraphrase_index
+    )
+    if args.question_variant == "paraphrased":
+        extend_paraphrase_vocabulary(
+            model, word2id, [question for _, question, _ in variants], source, args
+        )
     results = []
     with torch.no_grad():
-        for index, row in enumerate(rows, 1):
+        for index, (row, question, variant_index) in enumerate(variants, 1):
             predicted, terminal = navigate(
-                model, row["question"], row["source"], graph, word2id, rela2id,
+                model, question, row["source"], graph, word2id, rela2id,
                 relation_text, original, args
             )
             gold = set(row["answers"])
             found = set(terminal)
+            selected = select_entity(
+                terminal, dataset, row["question_number"], variant_index,
+                selector=args.entity_selector, seed=args.seed,
+            )
             results.append({
                 "question_number": row["question_number"],
+                "question": question,
+                "question_variant": args.question_variant,
+                "paraphrase_index": variant_index,
                 "hops": row["hops"],
                 "predicted_relations": predicted,
                 "gold_relations": row["gold_relations"],
                 "relation_chain_correct": predicted == row["gold_relations"],
+                "RED": relation_edit_distance(predicted, row["gold_relations"]),
+                "F1_REL": relation_f1(predicted, row["gold_relations"]),
+                "selected_answer": selected,
+                "hits_at_1": int(selected in gold),
+                "expected_hits_at_1_uniform": expected_uniform_hits_at_1(
+                    terminal, gold
+                ),
                 "answer_reachable": bool(gold & found),
                 "answer_set_exact": gold == found,
                 "terminal_frontier_size": len(terminal),
@@ -195,9 +248,18 @@ def evaluate(args):
                 "gold_answers": row["answers"],
             })
             if index % 100 == 0:
-                print(f"Evaluated {index}/{len(rows)}", flush=True)
-    summary = aggregate(results)
-    output = args.output or checkpoint / f"{args.split}_navigation"
+                print(f"Evaluated {index}/{len(variants)}", flush=True)
+    summary = aggregate(
+        results, args.question_variant, args.entity_selector, args.seed
+    )
+    if args.output:
+        output = args.output
+    elif args.question_variant == "canonical":
+        output = checkpoint / f"{args.split}_navigation"
+    else:
+        suffix = ("" if args.paraphrase_index == "all"
+                  else f"_{args.paraphrase_index}")
+        output = checkpoint / f"{args.split}_navigation_paraphrased{suffix}"
     output.parent.mkdir(parents=True, exist_ok=True)
     with open(output.with_suffix(".jsonl"), "w", encoding="utf-8") as stream:
         for row in results:
@@ -219,7 +281,19 @@ def main():
     parser.add_argument("--offline-source", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--limit", type=int, default=0,
-                        help="Evaluate only the first N examples for a smoke test")
+                        help="Evaluate only the first N QA records, before paraphrase expansion")
+    parser.add_argument("--question-variant", choices=("canonical", "paraphrased"),
+                        default="canonical",
+                        help="Use Question or released Question-Paraphrased variants")
+    parser.add_argument("--paraphrase-index", default="all",
+                        help="Evaluate all paraphrases (default) or one zero-based index")
+    parser.add_argument("--entity-selector", choices=("uniform", "first"),
+                        default="uniform",
+                        help="Gold-blind single-answer choice among reachable entities")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Stable per-question uniform tie-breaking seed")
+    parser.add_argument("--glove", type=Path, default=None,
+                        help="Required only for unseen paraphrase words with local GloVe")
     args = parser.parse_args()
     if args.device == "auto":
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
