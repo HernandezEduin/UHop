@@ -1,6 +1,9 @@
 """Small fixture tests for THESEUS-to-UHop relation-choice conversion."""
 import csv
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -88,6 +91,34 @@ class TheseusAdapterTests(unittest.TestCase):
             self.assertEqual(json.loads(
                 (target / "source.json").read_text(encoding="utf-8")
             )["graph_direction"], "forward_only")
+            if os.environ.get("UHOP_SMOKE_TRAINING") == "1":
+                # Test original UHop training with prepared data and no GPU.
+                repo = Path(__file__).resolve().parents[1]
+                for model in ("HR_BiLSTM_plus", "ABWIM_plus"):
+                    checkpoint = Path(tmp) / ("checkpoint_" + model)
+                    checkpoint.mkdir()
+                    command = [
+                        sys.executable, "main.py", "--train",
+                        "--framework", "UHop", "--model", model,
+                        "--dataset", "kinship", "--data_dir", str(target),
+                        "--path", str(checkpoint), "--device", "cpu",
+                        "--num_workers", "0", "--emb_size", "50",
+                        "--hidden_size", "8", "--epoch_num", "1",
+                        "--dynamic", "recurrent",
+                    ]
+                    environment = os.environ.copy()
+                    environment["OMP_NUM_THREADS"] = "1"
+                    environment["MKL_NUM_THREADS"] = "1"
+                    completed = subprocess.run(
+                        command, cwd=repo / "src", env=environment,
+                        capture_output=True, text=True, timeout=180
+                    )
+                    self.assertEqual(
+                        completed.returncode, 0,
+                        model + "\n" + completed.stdout[-3000:] +
+                        "\n" + completed.stderr[-3000:]
+                    )
+                    self.assertTrue((checkpoint / "model.pth").is_file())
 
     def test_missing_gold_relation_fails(self):
         with self.assertRaisesRegex(ValueError, "Gold relation"):
