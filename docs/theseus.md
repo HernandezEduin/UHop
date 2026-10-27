@@ -63,6 +63,23 @@ For each gold relation chain, the converter aggregates outgoing relations over t
 
 ## Train and evaluate
 
+The repository-root shell scripts use stable seed-specific checkpoint directories:
+
+~~~bash
+bash ./configs/kinship_train.sh
+bash ./configs/kinship_eval.sh
+bash ./configs/mquake_st_single_train.sh
+bash ./configs/mquake_st_single_eval.sh
+bash ./configs/mquake_st_multi_train.sh
+bash ./configs/mquake_st_multi_eval.sh
+~~~
+
+Run `prepare_theseus.py` for each dataset first. Defaults are seed 42,
+100 epochs, automatic device selection, canonical test questions, and learned
+termination. Use `SEED=0 EPOCHS=100 DEVICE=cuda` on training scripts, and
+`--question-variant paraphrased` or `--split valid` on evaluation scripts.
+For PQ/PQL mixed-hop benchmarks, see [PathQuestion-Family setup](pathquestion.md).
+
 Run the existing UHop entry point from src/, as in the original project:
 
 ~~~bash

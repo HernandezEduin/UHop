@@ -6,6 +6,8 @@ This is the code for our UHop [paper](https://arxiv.org/abs/1904.01246).
 
 Kinship and MQuAKE-ST can now be prepared and run with UHop's original relation-ranking and stop/continue training. See [THESEUS dataset setup and evaluation](docs/theseus.md). The adapter keeps relation-only UHop predictions distinct from entity-level graph navigation.
 
+The family-controlled PQ/PQL mixed-hop reconstructions can also be evaluated on filtered or source graphs. See [PathQuestion-Family setup](docs/pathquestion.md).
+
 ## Getting Started
 
 To train and evaluate this code:

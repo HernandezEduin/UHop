@@ -15,7 +15,10 @@ U_PATH, B_PATH = {}, {}
 U_PATH['wq'] = '../data/WQ/main_exp'
 U_PATH['wq_train1test2'] = '../data/WQ/train1test2_exp'
 U_PATH['sq'] = '../data/SQ'
-for dataset in ('kinship', 'mquake_st_single', 'mquake_st_multi'):
+for dataset in (
+    'kinship', 'mquake_st_single', 'mquake_st_multi',
+    'pq_filtered', 'pq_source', 'pql_filtered', 'pql_source',
+):
     U_PATH[dataset] = f'../data/THESEUS/{dataset}'
 for i in [1,2,3]:
     U_PATH[f'pq{i}'] = f'../data/PQ/PQ{i}'

@@ -5,7 +5,7 @@ This is an inference-only wrapper. UHop itself predicts relations, not unique
 entity-edge actions. Answer-set reachability is therefore not Hits@1.
 """
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
 import importlib
 import json
 import sys
@@ -243,12 +243,79 @@ def extend_paraphrase_vocabulary(model, word2id, questions, source, args):
     print(f"Added {len(new_tokens)} frozen paraphrase tokens at inference time.")
 
 
+def score_reference_chains(predicted, gold_chains):
+    """Score against any valid released relation chain, without gold at inference."""
+    if not gold_chains:
+        raise ValueError("No relation reference chains")
+    closest = min(
+        gold_chains,
+        key=lambda chain: (
+            relation_edit_distance(predicted, chain),
+            -relation_f1(predicted, chain),
+        ),
+    )
+    return {
+        "matched_gold_relations": closest,
+        "relation_chain_correct": predicted in gold_chains,
+        "RED": relation_edit_distance(predicted, closest),
+        "F1_REL": max(relation_f1(predicted, chain) for chain in gold_chains),
+    }
+
+
+def family_macro_summary(results):
+    """Average QA metrics within a family, then weight all families equally."""
+    metrics = (
+        "hits_at_1", "expected_hits_at_1_uniform", "relation_chain_correct",
+        "RED", "F1_REL", "answer_reachable", "answer_set_exact",
+        "terminal_frontier_size",
+    )
+    public_names = {
+        "relation_chain_correct": "relation_chain_accuracy",
+        "answer_reachable": "answer_reachability",
+        "answer_set_exact": "answer_set_exact_match",
+        "terminal_frontier_size": "mean_terminal_frontier_size",
+    }
+
+    def summarize(records):
+        families = defaultdict(list)
+        for item in records:
+            if not item.get("question_family_id"):
+                raise ValueError("Missing family ID in reconstructed PQ/PQL metadata")
+            families[item["question_family_id"]].append(item)
+        output = {
+            "family_count": len(families),
+            "question_count": len({str(item["question_number"]) for item in records}),
+            "count": len(records),
+        }
+        for metric in metrics:
+            output[public_names.get(metric, metric)] = (
+                sum(
+                    sum(item[metric] for item in group) / len(group)
+                    for group in families.values()
+                ) / len(families)
+            )
+        return output
+
+    by_hop = defaultdict(list)
+    for record in results:
+        by_hop[str(record["hops"])].append(record)
+    return {
+        "all": summarize(results),
+        "by_hop": {
+            hops: summarize(group) for hops, group in sorted(by_hop.items())
+        },
+    }
+
+
 def evaluate(args):
     checkpoint = Path(args.checkpoint).resolve()
     model_args = json.loads((checkpoint / "args.txt").read_text(encoding="utf-8"))
     dataset = model_args["dataset"].lower()
-    if dataset not in ("kinship", "mquake_st_single", "mquake_st_multi"):
-        raise ValueError("Checkpoint is not a THESEUS dataset run")
+    if dataset not in (
+        "kinship", "mquake_st_single", "mquake_st_multi",
+        "pq_filtered", "pq_source", "pql_filtered", "pql_source",
+    ):
+        raise ValueError("Unsupported UHop navigation dataset")
     if model_args.get("q_representation") != "lstm":
         raise ValueError("This wrapper supports UHop's original LSTM question mode")
     model_args["device"] = args.device
@@ -270,15 +337,24 @@ def evaluate(args):
     model.load_state_dict(torch.load(checkpoint / "model.pth", map_location=args.device))
     model.eval()
     source = json.loads((data_dir / "source.json").read_text(encoding="utf-8"))
-    kg_file = source["kg_file"]
-    if args.offline_source:
-        graph_path = args.offline_source / kg_file
+    if source.get("local_kg_file"):
+        reconstruction_root = args.offline_source or Path(source["reconstruction_root"])
+        graph_path = reconstruction_root / source["local_kg_file"]
+        if not graph_path.is_file():
+            raise FileNotFoundError(
+                f"Missing reconstructed KG: {graph_path}. "
+                "Pass --offline-source /path/to/PathQuestion-Family/generated"
+            )
     else:
-        from huggingface_hub import hf_hub_download
-        graph_path = hf_hub_download(
-            source["huggingface_repo"], kg_file, repo_type="dataset",
-            revision=source["revision"]
-        )
+        kg_file = source["kg_file"]
+        if args.offline_source:
+            graph_path = args.offline_source / kg_file
+        else:
+            from huggingface_hub import hf_hub_download
+            graph_path = hf_hub_download(
+                source["huggingface_repo"], kg_file, repo_type="dataset",
+                revision=source["revision"]
+            )
     graph, _, _ = read_graph(graph_path)
     rows = [json.loads(line) for line in
             (data_dir / f"{args.split}_metadata.jsonl").read_text(
@@ -288,9 +364,15 @@ def evaluate(args):
     if not rows:
         raise ValueError("Evaluation split is empty")
     if args.question_variant == "paraphrased":
-        qa_path = read_release_file(
-            dataset, source["qa_file"], args.offline_source, source["revision"]
-        )
+        if source.get("local_qa_file"):
+            reconstruction_root = args.offline_source or Path(source["reconstruction_root"])
+            qa_path = reconstruction_root / source["local_qa_file"]
+            if not qa_path.is_file():
+                raise FileNotFoundError(f"Missing reconstructed QA: {qa_path}")
+        else:
+            qa_path = read_release_file(
+                dataset, source["qa_file"], args.offline_source, source["revision"]
+            )
         with open(qa_path, encoding="utf-8-sig", newline="") as stream:
             paraphrases = load_paraphrases(stream, rows)
     else:
@@ -309,7 +391,14 @@ def evaluate(args):
                 model, question, row["source"], graph, word2id, rela2id,
                 relation_text, original, args
             )
-            gold = set(row["answers"])
+            if args.answer_reference == "graph":
+                if "graph_answers" not in row:
+                    raise ValueError("Graph-answer reference is unavailable for this dataset")
+                gold = set(row["graph_answers"])
+            else:
+                gold = set(row["answers"])
+            gold_chains = row.get("gold_relation_chains") or [row["gold_relations"]]
+            relation_metrics = score_reference_chains(predicted, gold_chains)
             found = set(terminal)
             selected = select_entity(
                 terminal, dataset, row["question_number"], variant_index,
@@ -325,9 +414,9 @@ def evaluate(args):
                 "stop_reason": stop_reason,
                 "predicted_hops": len(predicted),
                 "gold_relations": row["gold_relations"],
-                "relation_chain_correct": predicted == row["gold_relations"],
-                "RED": relation_edit_distance(predicted, row["gold_relations"]),
-                "F1_REL": relation_f1(predicted, row["gold_relations"]),
+                "gold_relation_chains": gold_chains,
+                "question_family_id": row.get("question_family_id"),
+                **relation_metrics,
                 "selected_answer": selected,
                 "hits_at_1": int(selected in gold),
                 "expected_hits_at_1_uniform": expected_uniform_hits_at_1(
@@ -337,7 +426,8 @@ def evaluate(args):
                 "answer_set_exact": gold == found,
                 "terminal_frontier_size": len(terminal),
                 "terminal_entities": terminal,
-                "gold_answers": row["answers"],
+                "gold_answers": sorted(gold),
+                "answer_reference": args.answer_reference,
             })
             if index % 100 == 0:
                 print(f"Evaluated {index}/{len(variants)}", flush=True)
@@ -345,6 +435,16 @@ def evaluate(args):
         results, args.question_variant, args.entity_selector, args.seed
     )
     summary["termination_mode"] = args.termination_mode
+    summary["answer_reference"] = args.answer_reference
+    if source.get("graph_regime"):
+        summary["graph_regime"] = source["graph_regime"]
+    if any(row.get("question_family_id") for row in results):
+        summary["family_macro"] = family_macro_summary(results)
+        summary["metric_warning"] += (
+            " PQ/PQL additionally reports family_macro, which weights each "
+            "structural question family equally. Relation fidelity uses the "
+            "closest released relation chain when alternatives are supplied."
+        )
     for group, records in [
         (summary["all"], results),
         *[(summary["by_hop"][str(hops)],
@@ -387,6 +487,9 @@ def main():
     parser.add_argument("--checkpoint", required=True,
                         help="UHop saved_model directory containing model.pth and args.txt")
     parser.add_argument("--split", choices=("train", "valid", "test"), default="test")
+    parser.add_argument("--answer-reference", choices=("released", "graph"),
+                        default="released",
+                        help="Evaluate released answers or active-KG graph-derived answers (PQ/PQL)")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--max-hops", type=int, default=8)
     parser.add_argument(
