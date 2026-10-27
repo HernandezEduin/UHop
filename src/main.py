@@ -1,5 +1,7 @@
 import argparse
 import os
+import random
+from typing import Optional
 #from UHop import UHop
 #from Baseline import Baseline
 from Framework import Framework
@@ -8,7 +10,23 @@ import json
 import numpy as np
 import torch
 
-torch.manual_seed(1126)
+def set_seeds(seed: Optional[int]) -> None:
+    """Seed Python, NumPy, and PyTorch for reproducible experiments."""
+    if seed is None:
+        return
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    # These settings reduce nondeterminism in CuDNN-backed operations.
+    if torch.backends.cudnn.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--model', action='store', type=str, default=None) # HR-BiLSTM, ABWIM, MVM
@@ -39,6 +57,7 @@ parser.add_argument('--dataset', action='store', type=str) #sq, wq, wq_train1_te
 parser.add_argument('--data_dir', type=str, default=None,
                     help='Override path of prepared THESEUS dataset')
 parser.add_argument('--device', choices=('auto', 'cpu', 'cuda'), default='auto')
+parser.add_argument('--seed', type=int, default=1126, help='Random seed for Python, NumPy, and PyTorch (default: 1126)')
 parser.add_argument('--num_workers', type=int, default=0)
 parser.add_argument('--saved_dir', action='store', type=str, default='saved_model')
 parser.add_argument('--hop_weight', action='store', type=float, default=1)
@@ -53,6 +72,7 @@ parser.add_argument('--pretrained_bert', action='store', type=str, default='bert
 parser.add_argument('--q_representation', action='store', type=str, default='lstm')
 
 args = parser.parse_args()
+set_seeds(args.seed)
 if args.device == 'auto':
     args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 if args.device == 'cuda' and not torch.cuda.is_available():
