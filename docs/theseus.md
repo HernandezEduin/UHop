@@ -167,3 +167,53 @@ python script/evaluate_theseus.py \\
 **Caution:** Relation-frontier reachability must not be reported as Hits@1. The reported `hits_at_1` is from the stated gold-blind single-entity selector. For direct comparison with learned entity-ranking models, retain the selection-method qualifier and report the expected uniform Hits@1 and frontier size alongside it.
 
 The original UHop paper is [Chen et al., NAACL 2019](https://aclanthology.org/N19-1031/). Please also cite the [THESEUS paper](https://arxiv.org/abs/2609.14528) and the dataset upstream sources.
+
+## Entity-edge reference baselines: random walk MC and shortest-path oracle
+
+`script/evaluate_theseus_baselines.py` implements independent entity-edge baselines
+following the conventions of the MINERVA THESEUS `random_walk_stats.py` and
+`shortcut_oracle_stats.py`. They use the **same released directed KG** and prepared
+split metadata as the UHop adapter, but do not load a UHop checkpoint. These
+baselines choose individual `(head, relation, tail)` edges (unlike UHop's relation
+frontier), and **exclude all self-edges and `NO_OP`/`no_operation` relations**.
+
+~~~bash
+# Monte Carlo: 20 independent random walks per test question, stop with p=0.5
+python script/evaluate_theseus_baselines.py --baseline random_walk \
+  --data-dir data/THESEUS/kinship --max-hops 3 \
+  --num-walks 20 --stop-policy fixed --stop-probability 0.5 --seed 42
+
+# Alternative: estimate a constant geometric stopping hazard using TRAIN only
+python script/evaluate_theseus_baselines.py --baseline random_walk \
+  --data-dir data/THESEUS/mquake_st_single --max-hops 4 \
+  --num-walks 100 --stop-policy train --seed 42
+
+# Diagnostic: no random early stopping (only dead ends / max hop)
+python script/evaluate_theseus_baselines.py --baseline random_walk \
+  --data-dir data/THESEUS/kinship --max-hops 3 --stop-policy none
+
+# Answer-aware oracle BFS; by default searches beyond the rollout budget,
+# matching MINERVA's shortest-path oracle convention.
+python script/evaluate_theseus_baselines.py --baseline shortest_path_oracle \
+  --data-dir data/THESEUS/mquake_st_multi --max-hops 4
+
+# To impose the identical finite budget on the oracle, add --cap-oracle.
+~~~
+
+The train-calibrated constant stopping probability is `p = N_train / sum(hops)`
+(geometric maximum-likelihood estimate). This uses **only training reference hop
+counts**, and never a test question's gold hop count or answers. Stop checks
+occur *after the first edge*; the walker may also terminate at a dead end or
+the configured `--max-hops`. Walks are sampled uniformly over outgoing entity
+edges; per-question/per-trial random seeds are stable under question reordering
+and `--limit` changes. No reference labels enter random-walk inference.
+
+Outputs default to `<data-dir>/<split>_<baseline>.jsonl` (individual trials,
+explicit predicted paths and stop reasons) and `.summary.json` (micro averages
+over the sampled trials, plus per-hop averages). For the oracle, absence of a
+path is reported explicitly; its answer-informed search is **not a predictive
+baseline**. The oracle has deterministic sorted-edge tie-breaking. Hits@1 is
+the sampled/oracle **single terminal entity**, not UHop's frontier selection.
+RED/F1_REL and PED/F1_SG are included; the latter use explicitly provided
+reference paths and do not yet expand multi-answer semantic path alternatives.
+Comparisons involving multi-answer PED/F1_SG must account for that distinction.
